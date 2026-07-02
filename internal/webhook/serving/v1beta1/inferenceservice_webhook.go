@@ -226,7 +226,7 @@ func (d *InferenceServiceCustomDefaulter) applyConnectionsAPI(
 		}
 
 	case connectionapi.ConnectionActionRemove:
-		if err := performISVCCleanup(isvc, oldConn); err != nil {
+		if err := performISVCCleanup(isvc, oldConn, ""); err != nil {
 			log.Error(err, "failed to cleanup connection")
 			return err
 		}
@@ -235,7 +235,7 @@ func (d *InferenceServiceCustomDefaulter) applyConnectionsAPI(
 		log.V(1).Info("connection changed, performing replacement",
 			"oldType", oldConn.Type, "newType", newConn.Type,
 			"oldSecret", oldConn.SecretName, "newSecret", newConn.SecretName)
-		if err := performISVCCleanup(isvc, oldConn); err != nil {
+		if err := performISVCCleanup(isvc, oldConn, newConn.Type); err != nil {
 			log.Error(err, "failed to cleanup old connection")
 			return err
 		}
@@ -505,17 +505,19 @@ func (d *InferenceServiceCustomDefaulter) handleHWPRemovalISVC(
 // performISVCCleanup removes previously injected connection credentials from the InferenceService
 // using typed field access.
 //
-// Dispatches cleanup based on the old connection type. Unknown type triggers full cleanup across
-// all possible injected fields.
+// Dispatches cleanup based on the old connection type. Unknown type triggers scoped cleanup
+// when the new type is known (Replace), or full cleanup when it is not (Remove).
 //
 // Parameters:
 //   - isvc: the InferenceService to clean up
 //   - oldConn: connection info from the previous object version
+//   - newConnType: the new connection type (non-empty on Replace, empty on Remove)
 //
 // Returns any error from cleanup.
 func performISVCCleanup(
 	isvc *servingv1beta1.InferenceService,
 	oldConn connectionapi.ConnectionInfo,
+	newConnType string,
 ) error {
 	switch oldConn.Type {
 	case connectionapi.ConnectionTypeProtocolOCI.String(), connectionapi.ConnectionTypeRefOCI.String():
@@ -534,7 +536,14 @@ func performISVCCleanup(
 
 	case "":
 		// Unknown type: the old Secret has been deleted or was never annotated.
-		// Perform full cleanup across all fields that any connection type could have set.
+		if newConnType != "" {
+			// We know the new type but not the old — only clean fields that the new type
+			// will re-inject, so we don't destroy user-provided fields.
+			cleanupByType(isvc, oldConn, newConnType)
+			break
+		}
+
+		// newConnType is empty (Remove action) — full cleanup since we don't know what was injected.
 		if oldConn.SecretName != "" {
 			connectionapi.CleanupOCIImagePullSecrets(&isvc.Spec.Predictor.ImagePullSecrets, oldConn.SecretName)
 		} else {
@@ -548,4 +557,25 @@ func performISVCCleanup(
 	}
 
 	return nil
+}
+
+// cleanupByType scopes cleanup to only the fields that a specific connection type injects.
+func cleanupByType(isvc *servingv1beta1.InferenceService, oldConn connectionapi.ConnectionInfo, connType string) {
+	switch connType {
+	case connectionapi.ConnectionTypeProtocolOCI.String(), connectionapi.ConnectionTypeRefOCI.String():
+		if oldConn.SecretName != "" {
+			connectionapi.CleanupOCIImagePullSecrets(&isvc.Spec.Predictor.ImagePullSecrets, oldConn.SecretName)
+		} else {
+			isvc.Spec.Predictor.ImagePullSecrets = nil
+		}
+	case connectionapi.ConnectionTypeProtocolURI.String(), connectionapi.ConnectionTypeRefURI.String():
+		if isvc.Spec.Predictor.Model != nil {
+			isvc.Spec.Predictor.Model.StorageURI = nil
+		}
+	case connectionapi.ConnectionTypeProtocolS3.String(), connectionapi.ConnectionTypeRefS3.String():
+		connectionapi.RemoveServiceAccountName(&isvc.Spec.Predictor.ServiceAccountName, oldConn.SecretName+"-sa")
+		if isvc.Spec.Predictor.Model != nil {
+			isvc.Spec.Predictor.Model.Storage = nil
+		}
+	}
 }

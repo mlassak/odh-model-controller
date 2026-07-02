@@ -328,6 +328,69 @@ var _ = Describe("InferenceService ConnectionsAPI Defaulter", func() {
 				Expect(newISVC.Spec.Predictor.Model.StorageURI).To(HaveValue(Equal("https://x")))
 			})
 
+			It("preserves storageUri on OCI Replace when old secret is deleted", func() {
+				// Old OCI secret is gone — cleanup gets Type="", but new type is OCI
+				// so only imagePullSecrets should be cleaned, not storageUri.
+				ociSecret := testutils.BuildSecret("new-oci", defaultNS, "oci", nil)
+				oldISVC := buildISVC(map[string]string{connectionapi.AnnotationConnections: "deleted-oci"})
+				uri := "oci://registry.example.com/model:latest"
+				newISVC := buildISVC(map[string]string{connectionapi.AnnotationConnections: "new-oci"})
+				newISVC.Spec.Predictor.Model = &kservev1beta1.ModelSpec{}
+				newISVC.Spec.Predictor.Model.StorageURI = &uri
+				newISVC.Spec.Predictor.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "deleted-oci"}}
+
+				Expect(newISVCDefaulter(newDefaulterFakeClient(ociSecret)).Default(defaultCtx(admissionv1.Update, oldISVC, false), newISVC)).To(Succeed())
+				// storageUri must survive — it's user-provided, not webhook-injected for OCI
+				Expect(newISVC.Spec.Predictor.Model.StorageURI).To(HaveValue(Equal(uri)))
+				// imagePullSecrets should be cleaned (old) and re-injected (new)
+				Expect(newISVC.Spec.Predictor.ImagePullSecrets).To(ConsistOf(corev1.LocalObjectReference{Name: "new-oci"}))
+			})
+
+			It("re-injects SA and storage on S3 Replace when old secret is deleted", func() {
+				// Old secret is gone — cleanup gets Type="", but new type is S3
+				// so only S3 fields (SA + storage) should be cleaned and re-injected.
+				s3Secret := testutils.BuildSecret(defaultS3Secret, defaultNS, "s3", nil)
+				cli := newDefaulterFakeClient(s3Secret)
+				oldISVC := buildISVC(map[string]string{connectionapi.AnnotationConnections: "deleted-s3"})
+				uri := "oci://registry.example.com/model:latest"
+				newISVC := buildISVC(map[string]string{
+					connectionapi.AnnotationConnections:    defaultS3Secret,
+					connectionapi.AnnotationConnectionPath: "models/v1",
+				})
+				newISVC.Spec.Predictor.ServiceAccountName = "deleted-s3-sa"
+				newISVC.Spec.Predictor.Model = &kservev1beta1.ModelSpec{}
+				newISVC.Spec.Predictor.Model.StorageURI = &uri
+
+				Expect(newISVCDefaulter(cli).Default(defaultCtx(admissionv1.Update, oldISVC, false), newISVC)).To(Succeed())
+				// S3 fields should be re-injected
+				Expect(newISVC.Spec.Predictor.ServiceAccountName).To(Equal(defaultS3SA))
+				Expect(newISVC.Spec.Predictor.Model.Storage).ToNot(BeNil())
+				Expect(newISVC.Spec.Predictor.Model.Storage.StorageKey).To(HaveValue(Equal(defaultS3Secret)))
+				Expect(newISVC.Spec.Predictor.Model.Storage.Path).To(HaveValue(Equal("models/v1")))
+				// storageUri should survive — scoped cleanup only touches S3 fields
+				Expect(newISVC.Spec.Predictor.Model.StorageURI).To(HaveValue(Equal(uri)))
+			})
+
+			It("preserves storage fields on URI Replace when old secret is deleted", func() {
+				// Old secret is gone — cleanup gets Type="", but new type is URI
+				// so only storageUri should be cleaned, not storage or imagePullSecrets.
+				uriSecret := testutils.BuildSecret("new-uri", defaultNS, "uri", map[string][]byte{"URI": []byte("https://new.example.com")})
+				oldISVC := buildISVC(map[string]string{connectionapi.AnnotationConnections: "deleted-uri"})
+				key := defaultS3Secret
+				newISVC := buildISVC(map[string]string{connectionapi.AnnotationConnections: "new-uri"})
+				newISVC.Spec.Predictor.Model = &kservev1beta1.ModelSpec{}
+				newISVC.Spec.Predictor.Model.Storage = &kservev1beta1.ModelStorageSpec{}
+				newISVC.Spec.Predictor.Model.Storage.StorageKey = &key
+				newISVC.Spec.Predictor.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "user-pull-secret"}}
+
+				Expect(newISVCDefaulter(newDefaulterFakeClient(uriSecret)).Default(defaultCtx(admissionv1.Update, oldISVC, false), newISVC)).To(Succeed())
+				// URI field should be re-injected
+				Expect(newISVC.Spec.Predictor.Model.StorageURI).To(HaveValue(Equal("https://new.example.com")))
+				// storage and imagePullSecrets should survive — scoped cleanup only touches URI fields
+				Expect(newISVC.Spec.Predictor.Model.Storage).ToNot(BeNil())
+				Expect(newISVC.Spec.Predictor.ImagePullSecrets).To(ConsistOf(corev1.LocalObjectReference{Name: "user-pull-secret"}))
+			})
+
 			It("replaces S3 fields when connection path changes", func() {
 				secret := testutils.BuildSecret(defaultS3Secret, defaultNS, "s3", nil)
 				oldISVC := buildISVC(map[string]string{
@@ -564,7 +627,7 @@ var _ = Describe("InferenceService ConnectionsAPI Defaulter", func() {
 			// directly since it is in the same package.
 			isvc := buildISVC(nil)
 			isvc.Spec.Predictor.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "a"}}
-			Expect(performISVCCleanup(isvc, connectionapi.ConnectionInfo{SecretName: "", Type: ""})).To(Succeed())
+			Expect(performISVCCleanup(isvc, connectionapi.ConnectionInfo{SecretName: "", Type: ""}, "")).To(Succeed())
 			Expect(isvc.Spec.Predictor.ImagePullSecrets).To(BeNil())
 		})
 
