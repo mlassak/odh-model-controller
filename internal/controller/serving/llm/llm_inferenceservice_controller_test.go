@@ -19,7 +19,7 @@ package llm_test
 import (
 	"context"
 	"os"
-
+	"strings"
 	"time"
 
 	kservev1alpha2 "github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
@@ -27,8 +27,10 @@ import (
 	kuadrantv1 "github.com/kuadrant/kuadrant-operator/api/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -225,9 +227,21 @@ var _ = Describe("LLMInferenceService Controller", func() {
 
 				fixture.VerifyHTTPRouteAuthPolicyExists(ctx, envTest.Client, testNs, LLMInferenceServiceName)
 
-				// Snapshot current ReconcileError event count so we only
-				// detect NEW errors after the stop annotation is set.
-				initialErrorCount := countReconcileErrors(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+				drainEvents := func(reason string) []string {
+					var matched []string
+					for {
+						select {
+						case ev := <-eventRecorder.Events:
+							if strings.Contains(ev, reason) {
+								matched = append(matched, ev)
+							}
+						default:
+							return matched
+						}
+					}
+				}
+
+				drainEvents("ReconcileError")
 
 				// Delete the HTTPRoute first to simulate kserve stop cleanup.
 				httpRouteName := constants.GetHTTPRouteName(LLMInferenceServiceName)
@@ -243,9 +257,9 @@ var _ = Describe("LLMInferenceService Controller", func() {
 				// The controller should not produce ReconcileError events for the
 				// stopped service (the bug's symptom was continuous warning events
 				// because AuthPolicy reconciliation tried to look up the deleted HTTPRoute).
-				Consistently(func() bool {
-					return countReconcileErrors(ctx, envTest.Client, testNs, LLMInferenceServiceName) > initialErrorCount
-				}).WithTimeout(2 * time.Second).WithPolling(100 * time.Millisecond).WithContext(ctx).Should(BeFalse())
+				Consistently(func() []string {
+					return drainEvents("ReconcileError")
+				}).WithTimeout(2 * time.Second).WithPolling(100 * time.Millisecond).WithContext(ctx).Should(BeEmpty())
 			})
 		})
 	})
@@ -433,6 +447,179 @@ var _ = Describe("BaseRefs and Spec Merging", func() {
 	})
 })
 
+var _ = Describe("LLMInferenceService PodMonitor", func() {
+	var testNs string
+
+	BeforeEach(func(ctx SpecContext) {
+		testNamespace := testutils.Namespaces.Create(ctx, envTest.Client)
+		testNs = testNamespace.Name
+	})
+
+	AfterEach(func(ctx SpecContext) {
+		llmList := &kservev1alpha2.LLMInferenceServiceList{}
+		if err := envTest.Client.List(ctx, llmList, client.InNamespace(testNs)); err == nil {
+			for i := range llmList.Items {
+				_ = envTest.Client.Delete(ctx, &llmList.Items[i])
+			}
+		}
+	})
+
+	Context("PodMonitor lifecycle", func() {
+		It("should create PodMonitor with correct owner reference when LLMInferenceService is created", func(ctx SpecContext) {
+			fixture.CreateBasicLLMInferenceService(ctx, envTest.Client, testNs, LLMInferenceServiceName, nil)
+
+			fixture.VerifyLLMISvcPodMonitorExists(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+			fixture.VerifyLLMISvcPodMonitorOwnerRef(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+		})
+
+		It("should create PodMonitor with discovery and management labels", func(ctx SpecContext) {
+			fixture.CreateBasicLLMInferenceService(ctx, envTest.Client, testNs, LLMInferenceServiceName, nil)
+
+			fixture.VerifyLLMISvcPodMonitorLabels(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+		})
+
+		It("should set owner reference for garbage collection on LLMInferenceService deletion", func(ctx SpecContext) {
+			fixture.CreateBasicLLMInferenceService(ctx, envTest.Client, testNs, LLMInferenceServiceName, nil)
+
+			fixture.VerifyLLMISvcPodMonitorOwnerRef(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+		})
+
+		It("should recreate PodMonitor when it is externally deleted", func(ctx SpecContext) {
+			fixture.CreateBasicLLMInferenceService(ctx, envTest.Client, testNs, LLMInferenceServiceName, nil)
+
+			fixture.VerifyLLMISvcPodMonitorExists(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+
+			podMonitor := fixture.WaitForResource(ctx, envTest.Client, testNs,
+				constants.GetLLMISvcPodMonitorName(LLMInferenceServiceName),
+				&monitoringv1.PodMonitor{})
+			Expect(envTest.Client.Delete(ctx, podMonitor)).Should(Succeed())
+
+			fixture.VerifyLLMISvcPodMonitorExists(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+		})
+
+		It("should not create PodMonitor when LLMInferenceService is stopped", func(ctx SpecContext) {
+			llmisvc := fixture.LLMInferenceService(LLMInferenceServiceName,
+				fixture.InNamespace[*kservev1alpha2.LLMInferenceService](testNs),
+				fixture.WithAnnotation(kserveconstants.StopAnnotationKey, "true"),
+			)
+			Expect(envTest.Client.Create(ctx, llmisvc)).Should(Succeed())
+
+			fixture.VerifyLLMISvcPodMonitorNotExist(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+		})
+
+		It("should not create PodMonitor when scrape label is false", func(ctx SpecContext) {
+			llmisvc := fixture.LLMInferenceService(LLMInferenceServiceName,
+				fixture.InNamespace[*kservev1alpha2.LLMInferenceService](testNs),
+				fixture.WithLabel(constants.RhoaiObservabilityLabel, "false"),
+			)
+			Expect(envTest.Client.Create(ctx, llmisvc)).Should(Succeed())
+
+			fixture.VerifyLLMISvcPodMonitorNotExist(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+		})
+
+		It("should delete PodMonitor when scrape label is set to false", func(ctx SpecContext) {
+			fixture.CreateBasicLLMInferenceService(ctx, envTest.Client, testNs, LLMInferenceServiceName, nil)
+
+			fixture.VerifyLLMISvcPodMonitorExists(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+
+			llmisvc := &kservev1alpha2.LLMInferenceService{}
+			Expect(envTest.Client.Get(ctx, types.NamespacedName{
+				Name: LLMInferenceServiceName, Namespace: testNs,
+			}, llmisvc)).Should(Succeed())
+
+			if llmisvc.Labels == nil {
+				llmisvc.Labels = make(map[string]string)
+			}
+			llmisvc.Labels[constants.RhoaiObservabilityLabel] = "false"
+			Expect(envTest.Client.Update(ctx, llmisvc)).Should(Succeed())
+
+			Eventually(func() error {
+				return fixture.CheckResourceNotFound(ctx, envTest.Client, testNs,
+					constants.GetLLMISvcPodMonitorName(LLMInferenceServiceName),
+					&monitoringv1.PodMonitor{})
+			}).WithContext(ctx).Should(Succeed())
+		})
+
+		It("should recreate PodMonitor when scrape label is removed after being set to false", func(ctx SpecContext) {
+			fixture.CreateBasicLLMInferenceService(ctx, envTest.Client, testNs, LLMInferenceServiceName, nil)
+
+			fixture.VerifyLLMISvcPodMonitorExists(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+
+			llmisvc := &kservev1alpha2.LLMInferenceService{}
+			Expect(envTest.Client.Get(ctx, types.NamespacedName{
+				Name: LLMInferenceServiceName, Namespace: testNs,
+			}, llmisvc)).Should(Succeed())
+
+			if llmisvc.Labels == nil {
+				llmisvc.Labels = make(map[string]string)
+			}
+			llmisvc.Labels[constants.RhoaiObservabilityLabel] = "false"
+			Expect(envTest.Client.Update(ctx, llmisvc)).Should(Succeed())
+
+			Eventually(func() error {
+				return fixture.CheckResourceNotFound(ctx, envTest.Client, testNs,
+					constants.GetLLMISvcPodMonitorName(LLMInferenceServiceName),
+					&monitoringv1.PodMonitor{})
+			}).WithContext(ctx).Should(Succeed())
+
+			Expect(envTest.Client.Get(ctx, types.NamespacedName{
+				Name: LLMInferenceServiceName, Namespace: testNs,
+			}, llmisvc)).Should(Succeed())
+			delete(llmisvc.Labels, constants.RhoaiObservabilityLabel)
+			Expect(envTest.Client.Update(ctx, llmisvc)).Should(Succeed())
+
+			fixture.VerifyLLMISvcPodMonitorExists(ctx, envTest.Client, testNs, LLMInferenceServiceName)
+		})
+
+		It("should create PodMonitor with combined selector covering single-node and multi-node topologies", func(ctx SpecContext) {
+			fixture.CreateBasicLLMInferenceService(ctx, envTest.Client, testNs, LLMInferenceServiceName, nil)
+
+			Eventually(func(g Gomega) {
+				pm, err := fixture.GetResourceByName(ctx, envTest.Client, testNs,
+					constants.GetLLMISvcPodMonitorName(LLMInferenceServiceName),
+					&monitoringv1.PodMonitor{})
+				g.Expect(err).NotTo(HaveOccurred())
+
+				g.Expect(pm.Spec.Selector.MatchLabels).To(HaveKeyWithValue(
+					kserveconstants.KubernetesAppNameLabelKey, LLMInferenceServiceName))
+				g.Expect(pm.Spec.Selector.MatchLabels).To(HaveKeyWithValue(
+					kserveconstants.KubernetesPartOfLabelKey, kserveconstants.LLMInferenceServicePartOfValue))
+
+				g.Expect(pm.Spec.Selector.MatchExpressions).To(HaveLen(1))
+				expr := pm.Spec.Selector.MatchExpressions[0]
+				g.Expect(expr.Key).To(Equal(kserveconstants.KubernetesComponentLabelKey))
+				g.Expect(expr.Operator).To(Equal(metav1.LabelSelectorOpIn))
+				g.Expect(expr.Values).To(ContainElements(
+					kserveconstants.LLMComponentWorkload,
+					kserveconstants.LLMComponentWorkloadLeader,
+					kserveconstants.LLMComponentWorkloadWorker,
+				))
+			}).WithContext(ctx).Should(Succeed())
+		})
+
+		It("should restore PodMonitor spec when modified externally", func(ctx SpecContext) {
+			fixture.CreateBasicLLMInferenceService(ctx, envTest.Client, testNs, LLMInferenceServiceName, nil)
+
+			podMonitor := fixture.WaitForResource(ctx, envTest.Client, testNs,
+				constants.GetLLMISvcPodMonitorName(LLMInferenceServiceName),
+				&monitoringv1.PodMonitor{})
+
+			originalEndpoints := len(podMonitor.Spec.PodMetricsEndpoints)
+
+			podMonitor.Spec.PodMetricsEndpoints = nil
+			Expect(envTest.Client.Update(ctx, podMonitor)).Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				pm, err := fixture.GetResourceByName(ctx, envTest.Client, testNs,
+					constants.GetLLMISvcPodMonitorName(LLMInferenceServiceName),
+					&monitoringv1.PodMonitor{})
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(pm.Spec.PodMetricsEndpoints).To(HaveLen(originalEndpoints))
+			}).WithContext(ctx).Should(Succeed())
+		})
+	})
+})
+
 // Helper Functions
 
 // createTestGateway creates a basic gateway for testing in the given namespace.
@@ -467,28 +654,6 @@ func createCrossNamespaceGateway(ctx context.Context, name, namespace string) {
 		}),
 	)
 	Expect(envTest.Client.Create(ctx, gw)).Should(Succeed())
-}
-
-// countReconcileErrors returns the number of ReconcileError events for the
-// given LLMInferenceService, including aggregated event counts.
-func countReconcileErrors(ctx context.Context, c client.Client, namespace, name string) int32 {
-	eventList := &corev1.EventList{}
-	if err := c.List(ctx, eventList, client.InNamespace(namespace)); err != nil {
-		return 0
-	}
-	var total int32
-	for _, ev := range eventList.Items {
-		if ev.Reason == "ReconcileError" &&
-			ev.InvolvedObject.Name == name &&
-			ev.InvolvedObject.Kind == "LLMInferenceService" {
-			if ev.Count > 0 {
-				total += ev.Count
-			} else {
-				total++
-			}
-		}
-	}
-	return total
 }
 
 // verifyResourcePersistentlyAbsent checks that a resource remains absent (Consistently + IsNotFound).
